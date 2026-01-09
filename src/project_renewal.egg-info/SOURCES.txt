@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/project_renewal/__init__.py
+src/project_renewal/__main__.py
+src/project_renewal.egg-info/PKG-INFO
+src/project_renewal.egg-info/SOURCES.txt
+src/project_renewal.egg-info/dependency_links.txt
+src/project_renewal.egg-info/requires.txt
+src/project_renewal.egg-info/top_level.txt
+tests/test_smoke.py
