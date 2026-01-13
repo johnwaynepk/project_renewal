@@ -1,4 +1,5 @@
 from __future__ import annotations
+from openpyxl.styles import PatternFill
 
 import argparse
 from pathlib import Path
@@ -9,7 +10,11 @@ import pandas as pd
 
 TIERS_ALLOWED = {"enterprise", "enterprise ai", "inspect pro", "starter+"}
 PRODUCT_ALLOWED = "inspect"
+BU_EXCLUDE = "proceq hq"
+BU_MISSING_MARKERS = {"", "#n/a", "n/a", "na", "none", "null"}
 
+ORANGE_FILL = PatternFill(start_color="FFFFA500", end_color="FFFFA500", fill_type="solid")  # Orange
+YELLOW_FILL = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")  # Yellow
 
 def project_root_from_this_file() -> Path:
     """
@@ -126,25 +131,89 @@ def filter_license_rows(license_df: pd.DataFrame) -> pd.DataFrame:
     """
     Filter license.csv:
       - Product == Inspect (case-insensitive)
-      - Tier in {Enterprise, Inspect Pro, Starter+} (case-insensitive)
+      - Tier in {Enterprise, Enterprise AI, Inspect Pro, Starter+} (case-insensitive)
+      - BU is NOT:
+          * "Proceq HQ"
+          * blank/empty
+          * missing markers like "#N/A", "N/A", "NA", "None", "Null"
     """
-    required_cols = {"Contract ID", "Product", "Tier"}
+    required_cols = {"Contract ID", "Product", "Tier", "BU"}
     missing = required_cols - set(license_df.columns)
     if missing:
         raise ValueError(f"license.csv is missing columns: {sorted(missing)}")
 
     product_norm = license_df["Product"].astype(str).str.strip().str.lower()
     tier_norm = license_df["Tier"].astype(str).str.strip().str.lower()
+    bu_norm = license_df["BU"].astype(str).str.strip().str.lower()
 
-    mask = product_norm.eq(PRODUCT_ALLOWED) & tier_norm.isin(TIERS_ALLOWED)
+    mask = (
+        product_norm.eq(PRODUCT_ALLOWED)
+        & tier_norm.isin(TIERS_ALLOWED)
+        & ~bu_norm.eq(BU_EXCLUDE)
+        & ~bu_norm.isin(BU_MISSING_MARKERS)
+    )
     return license_df.loc[mask].copy()
+
+def autofit_excel_columns(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame) -> None:
+    """
+    Auto-fit column widths in the given Excel sheet based on cell content length.
+    Works with openpyxl engine.
+    """
+    worksheet = writer.sheets[sheet_name]
+    for idx, col in enumerate(df.columns, 1):
+        # Compute max width from column header + all values (converted to string)
+        series = df[col].astype(str).fillna("")
+        max_len = max([len(str(col))] + series.map(len).tolist())
+        worksheet.column_dimensions[worksheet.cell(row=1, column=idx).column_letter].width = min(max_len + 2, 60)
+
+def highlight_expiring_rows(
+    writer: pd.ExcelWriter,
+    sheet_name: str,
+    df: pd.DataFrame,
+    date_col: str = "Expiration",
+) -> None:
+    """
+    Highlight entire rows based on Expiration date:
+      - 0–30 days from today: orange
+      - 31–60 days from today: yellow
+
+    Rows with missing/invalid dates (blank, #N/A, NA, etc.) are not highlighted.
+    """
+    if date_col not in df.columns:
+        return
+
+    ws = writer.sheets[sheet_name]
+
+    # Parse dates robustly (strings -> datetime). Invalid values become NaT.
+    exp = pd.to_datetime(df[date_col], errors="coerce")
+
+    today = pd.Timestamp.today().normalize()
+
+    # Excel row indexing:
+    # row 1 = header, row 2 = first data row
+    for excel_row_idx, exp_ts in enumerate(exp, start=2):
+        if pd.isna(exp_ts):
+            continue
+
+        days_to_expiry = (exp_ts.normalize() - today).days
+
+        if 0 <= days_to_expiry <= 30:
+            fill = ORANGE_FILL
+        elif 31 <= days_to_expiry <= 60:
+            fill = YELLOW_FILL
+        else:
+            continue
+
+        # Apply fill across the whole row (all columns in df)
+        for col_idx in range(1, df.shape[1] + 1):
+            ws.cell(row=excel_row_idx, column=col_idx).fill = fill
 
 
 def consolidate(data_dir: Path) -> Path:
     contract_path = data_dir / "contract.csv"
     license_path = data_dir / "license.csv"
     finance_path = data_dir / "finance.csv"
-    output_path = data_dir / "consolidated.csv"
+    output_path = data_dir / "consolidated.xlsx"
 
     # ---- Read inputs ----
     lic_df = read_license_csv(license_path)
@@ -197,12 +266,42 @@ def consolidate(data_dir: Path) -> Path:
     # ---- Output ----
     out_df = pd.DataFrame(items)
 
-    # Ensure the data folder exists (in case someone runs this on a fresh repo)
+    # Use "Expiration" as the key: sort by Expiration date (invalid/missing go last)
+    if "Expiration" in out_df.columns:
+        _exp_sort = pd.to_datetime(out_df["Expiration"], errors="coerce")
+        out_df = (
+            out_df.assign(_exp_sort=_exp_sort)
+            .sort_values("_exp_sort", na_position="last")
+            .drop(columns=["_exp_sort"])
+        )
+
+    # ---- Ensure "Customer name" is the 2nd column ----
+    if "Customer name" not in out_df.columns:
+        out_df["Customer name"] = "#NA"
+
+    cols = list(out_df.columns)
+
+    # Prefer Contract ID as the first column if present; otherwise keep the first non-customer-name column
+    if "Contract ID" in cols:
+        first_col = "Contract ID"
+    else:
+        first_col = next((c for c in cols if c != "Customer name"), cols[0])
+
+    new_cols = [first_col, "Customer name"] + [c for c in cols if c not in {first_col, "Customer name"}]
+    out_df = out_df[new_cols]
+
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    out_df.to_csv(output_path, index=False, encoding="utf-8")
+    sheet_name = "consolidated"
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        out_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
-    # Optional console summary (helpful for quick sanity check)
+        # Highlight expiring rows based on Expiration:
+        highlight_expiring_rows(writer, sheet_name, out_df, date_col="Expiration")
+
+        # If you already have autofit_excel_columns(), keep using it:
+        autofit_excel_columns(writer, sheet_name, out_df)
+
     print(f"Filtered licenses: {len(lic_filtered):,} rows")
     print(f"Missing contract matches (ID not found in contract.csv): {missing_contract:,}")
     print(f"Missing finance matches (Customer name defaulted to #NA): {missing_finance:,}")
