@@ -2,8 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Bytecode / optimized / DLL files
 *.so
 
 # Distribution / packaging
@@ -66,9 +64,11 @@ htmlcov/
 *.swp
 *~
 
-*.pyc
+# ---- Outputs / generated files ----
+*.xlsx
+*.csv
+
+# ---- Data folder ----
+# Keep the folder (via data/.gitkeep), but ignore all data files
 data/*
 !data/.gitkeep
-
-# Don’t commit customer/data exports
-data/
