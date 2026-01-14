@@ -65,3 +65,10 @@ htmlcov/
 *.tmp
 *.swp
 *~
+
+*.pyc
+data/*
+!data/.gitkeep
+
+# Don’t commit customer/data exports
+data/
